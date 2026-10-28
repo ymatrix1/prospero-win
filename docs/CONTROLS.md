@@ -9,8 +9,9 @@ Plug them into the PS5 and they work in every game, alongside the
 controller. You can plug them in after the game has started; the app looks
 for them every few seconds. Keys reach the game just as they would on a PC,
 modifiers included (Ctrl, Shift, Alt, the Windows keys), and the mouse moves
-the same pointer the DualSense's stick does. The mouse wheel doesn't work
-yet.
+the same pointer the DualSense's stick does. The vertical mouse wheel is
+forwarded as Windows wheel input (one detent is 120 units). Horizontal scrolling and Logitech-specific gestures are not
+yet supported.
 
 ## The DualSense
 
@@ -79,9 +80,13 @@ Games from the Xbox 360 era and later read a controller through XInput. With
 | L3, R3 | stick clicks |
 | Options | Start |
 | Create | Back |
+| touchpad click, left half | Back |
+| touchpad click, right half | Guide (the Xbox button) |
 | sticks, d-pad | sticks, d-pad |
 
-Rumble works: the game's vibration drives the DualSense's motors. The
+The touchpad's left half gives Back without Create, whose press also opens
+the PS5's capture menu; the half is the one the click began on. Rumble
+works: the game's vibration drives the DualSense's motors. The
 `gamepad.input` preset is exactly this. You can still add button lines in an
 XInput preset to send keys as well.
 
@@ -127,7 +132,8 @@ Options + Create stays the first player's.
 
 ## Closing a game
 
-Hold **Options + Create** for a second on the DualSense. The game is asked
+Hold **Options + Create** for three seconds on the DualSense (games use
+Start + Select together, so a short press never closes). The game is asked
 to close as with Alt+F4, and you return to the launcher; if it doesn't close
 within a few seconds, the app leaves it. From a keyboard, Alt+F4 or the
 game's own quit option do the same.

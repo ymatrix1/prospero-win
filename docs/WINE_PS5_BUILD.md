@@ -104,6 +104,7 @@ before evaluating a candidate built from that cache.
 | 0614 | `wow64`: when the environment's `wow64native.dll` does not start (ntdll reports no native readiness, patch 0883), the process loads `wowprospero.dll` and runs on the translator instead of ending at its first 32-bit instruction; the log has `wow64native.dll did not start (<status>); using wowprospero.dll` |
 | 0770 | `server`, `ntdll`: on PS5, the client thread runs sync-object and handle requests itself under a server lock instead of waking the server thread twice through the pipes; see [Sync requests on the client threads](#sync-requests-on-the-client-threads) |
 | 0790 | `server`, `ntdll`: opt-in immediate mutex acquire/release using the authoritative server object without request marshalling or waiter allocation; see [Immediate mutex calls](#immediate-mutex-calls) |
+| 0871 | `server`: past the first 64 directories open at once, a directory's descriptor is closed once its open is checked ("parked") and opened again by name, with `O_DIRECTORY` and the same device and inode, the first time it is needed. .NET keeps a handle open for every subdirectory still to list, so SMAPI's scan of a large mods folder ran out of descriptors (EMFILE); on a host Wine with a 512-descriptor limit the stock server fails such a listing of 3001 directories (`tests/test_wine_directory_handles.py`, `PROSPERO_TEST_NOFILE=512`) at about 230 queued handles and a server built with `PS5_PARK_DIRECTORIES` completes it. Renaming the directory through another handle gives the parked ones its new name, but a parked handle does not follow a rename of a directory above it, hence the threshold. Whether an fd is parked is tested inline, so one that is not costs no call. `WINE_PS5_PARK_DIRECTORIES=0` parks nothing, `=N` moves the threshold |
 | 0877 | `secur32`: a handshake GnuTLS fails for a reason schannel does not map logs the GnuTLS code and message and the clock through the err channel (and a fatal alert the clock), where the caller saw SEC_E_INTERNAL_ERROR and gnutls_perror went to stderr; on the console a date behind the certificates' makes every chain not yet valid |
 | 0878 | `crypt32`: on PS5 the root store is filled from `share/wine/ca-certificates.crt` beside the runtime, found from crypt32.prx's own path, before the system paths a title cannot see; a bundle that is not there is an error in the log, since no chain then verifies |
 | 0879 | `win32u`: the PS5 driver's ProcessEvents reports the wake pipe as handled whenever it read it; the pipe is every GUI thread's queue fd, so a thread whose events another thread had taken kept QS_DRIVER set with its fd unarmed, and a zero-timeout message wait (DirectInput's GetDeviceState) spun until the next input, so a game stalled while a button was held |
@@ -128,6 +129,7 @@ before evaluating a candidate built from that cache.
 | 0971 | `kernelbase`: in a PS5 title (`WINE_PS5_NTDLL_DIR` set, read at DLL attach), `UnhandledExceptionFilter` calls the game's own filter, logs `wine: Unhandled ... (thread N), no debugger, ending the process` and returns `EXCEPTION_EXECUTE_HANDLER`, so the process ends through patch 0896. winedbg can never start in a title (0550), and `start_debugger`'s heap allocations before `CreateProcessW` waited forever when another game thread held the process heap lock (Call of Juarez Gunslinger froze) |
 | 0972 | `faudio` (Wine's bundled FAudio 26.09): upstream FAudio a3b49d6 and 2ead980 (2026-09-26). A source voice that played at the output rate never advanced `resampleOffset`, so when it started resampling, the tap loops of `FAudio_INTERNAL_MixSource` ran from the stale offset, `toResample - tap_samples` wrapped and the SSE2 resampler wrote far past `resampled_audio`. Call of Juarez Gunslinger corrupted its process heap and crashed in the mixer, or in the heap. FAudio is a static library, so every `xaudio2_*` and `xactengine*` module is in `PE_MODULES` |
 | 0973 | `ntdll`: a private process information class, `ProcessWineTitleMenu` (0x50574D01), returns the title's in-game menu (`wine/ps5/menu/pw_title_menu.h`): the text and cursor the title stored in the sink with `pw_wine_set_menu`, for DXVK's HUD to draw over the game once a frame. Pointer-free, one layout for PE32 and PE64; WoW64 passes it through as it does the QPC anchor (0900), and it is never traced (0970). On a PC, `PW_TITLE_MENU_DEMO=1` returns a fixed demo menu so the drawing can be checked without a console |
+| 0974 | `ntdll`: outside images, a page made read-only or inaccessible takes writing, or all access, away from its whole 16 KiB host page, so touching it faults as on Windows; the host page used to get the union of its pages' protections, and a write to a protected page beside a writable one raised nothing (DuckStation then ran stale recompiled code). An access that faults only because of such a neighbour is single-stepped with the host page open for that one instruction, unseen by the program. On a PC, `WINE_HOST_PAGE_SIZE=16384` keeps 16 KiB host pages to run this scheme (`tests/test_wine_subpage_protect.py`) |
 
 ## Allocator
 
@@ -732,6 +734,65 @@ back buffer back (`GetRenderTargetData`/`LockRect`, or a staging copy and
 | DXVK 2.6.2 D3D11, D3D10, D3D9, D3D8 pixel controls, x64 and x86 | Both frames read back with the expected centre pixel (`844c1cff`, then `1c4c84ff`) and no mismatches; every call returns `S_OK`; ps5vk logs a completed flip for each frame (`PS5VK_VIDEO_PRESENTED`, tokens 1 and 2) and no refusal |
 | ps5vk's `vkmap` probe, x86 | Two host-visible buffers map at 32-bit addresses (`0x818e0000`, `0x81900000`) through ps5vk's low CPU alias, and a 1,024-byte GPU copy between them has no mismatches |
 
+## Direct3D 12
+
+Direct3D 12 games use [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton)'s
+`d3d12` and `d3d12core` beside DXVK's `dxgi`, which makes their swapchain:
+
+```text
+game (PE) -> vkd3d-proton d3d12/d3d12core + DXVK dxgi (PE, system32) -> winevulkan.dll
+  -> winevulkan.prx -> win32u.prx -> libvulkan.prx (RADV) -> AGC and VideoOut
+```
+
+`tools/pw_install.py` installs them with `wine: {dxvk: true, vkd3d: true}`
+(3.0.1, pinned by hash) and sets `d3d12,d3d12core=n` in the registry and
+the profile. A 64-bit game's Vulkan calls take Wine's plain thunks; only
+32-bit games go through the command-stream batching.
+
+What vkd3d-proton gets from RADV, read from PS5_Mesa's source (PS5_Vulkan's
+pin `1ba9874f`) and vkd3d-proton 3.0.1's device setup:
+
+- **Feature level 11_1.** RADV reports sparse binding and residency but not
+  `shaderResourceResidency` or `residencyNonResidentStrict` (the PS5
+  winsys has no PRT, `has_sparse_prt=false`), so vkd3d-proton offers tiled
+  resources tier 1, and feature level 12_0 needs tier 2. A game that asks
+  `D3D12CreateDevice` for 11_0 or 11_1 gets a device; one that asks for
+  12_0 or later gets `E_INVALIDARG`. Its profile can set
+  `[debug] env = VKD3D_FEATURE_LEVEL=12_0` (or `12_1`): vkd3d-proton then
+  reports tier 2, which is safe only for a game that never uses tiled
+  resources, since RADV maps every unbound page to one shared block.
+  12_2 also needs variable-rate shading, which this GPU does not have.
+- Shader model 6.8, resource binding tier 3, ROVs and conservative
+  rasterization tier 3, DXR 1.1 (`VKD3D_CONFIG=nodxr` turns it off), mesh
+  shaders tier 1 (emulated by RADV), ExecuteIndirect without
+  device-generated commands. Timeline semaphores are Mesa's emulation, and
+  the compute queues share the graphics ring, so async compute does not
+  overlap.
+- The in-game menu and the FPS counter are drawn by DXVK's HUD (patch
+  0973), which a Direct3D 12 game, drawing through vkd3d-proton, does not
+  have.
+
+`tests/d3d12_control.c` is the check: a device at feature level 11_0, its
+highest feature level, shader model and tiers, then two frames on a
+1920x1080 flip-model swapchain, each cleared, drawn with shaders compiled
+on the spot (`d3dcompiler_47`), read back at the centre (the triangle) and a
+corner (the clear colour), and presented. `tests/test_d3d12_control.py`
+runs it under the host Wine with `PROSPERO_TEST_D3D12=1`: on an RTX 3060
+it reports feature level 12_2 and shader model 6.8 and passes. On the
+console it runs as a game, in a prefix `pw_install.py` set up with
+`wine: {dxvk: true, vkd3d: true}`; its result line reaches the log as
+`STDOUT`.
+
+Console result (2026-10-28, the runtime then installed, RADV 26.2.0):
+
+| Check | Result |
+| --- | --- |
+| Device at feature level 11_0 | `S_OK`, on vkd3d-proton's descriptor-buffer path with mutable descriptors |
+| Highest feature level, shader model | 11_1 (`0xb100`) and 6.8, as read from the source above |
+| Tiers | resource binding 3, tiled resources 1, ROVs, conservative rasterization 3, DXR 1.1; no mesh shaders (that runtime's RADV predates barycentrics) and no VRS |
+| Two frames, 1920x1080 flip-model swapchain | both drawn, read back (triangle `ffff0000`, corners `ff1c4c84` then `ff844c1c`) and presented `S_OK`; `KHR_present_wait` in use |
+| Run | no vkd3d-proton warning or error; the program exited and the title went back to the launcher |
+
 ## OpenGL
 
 OpenGL games draw through Mesa's Zink, which runs OpenGL on top of the
@@ -996,7 +1057,20 @@ The title runs one game per process (`src/pw_wine_launch.h`):
     drawn by the game's own graphics backend. A DXVK game gets
     DXVK's counter (`DXVK_HUD=fps`). A `graphics = opengl` game gets Mesa's
     (`GALLIUM_HUD=simple,fps`), drawn by Zink. It's on by default;
-    `show_fps = false` turns it off;
+    `show_fps = false` turns it off. With `framegen` on, the counter is
+    frame generation's own instead (`PW_FRAMEGEN_HUD=1`), for any backend:
+    the game's frames and the pictures shown each second, `30 -> 60`;
+  - `[display] framegen = 2`, `3` or `4` (default `off`) sets `PW_FRAMEGEN`:
+    `libvulkan.prx` (`wine/ps5/pw_framegen.cpp`) gives the screen that many
+    pictures for each frame the game presents, the ones between made by
+    MihawkGen's neural interpolation (`third_party/mihawkgen`). It works
+    on any game that presents through Vulkan (DXVK, Zink or Vulkan itself),
+    adds extra images to the swapchain and forces FIFO, so the console's
+    60 Hz paces them: `2` takes a 30 fps game to 60. A game that already
+    presents 60 is slowed by it. The generated picture needs the next
+    frame, so the game's frames are shown about one frame later. Once a
+    second the log has `pw_framegen: N frames/s from the program, M
+    pictures/s presented`;
   - `[display] refresh` and `opengl_thread` set the PS5 OpenGL SDK's output
     rate and glthread worker. Zink has neither, so they are accepted for
     existing profiles and ignored; the launcher logs
@@ -1012,12 +1086,14 @@ The title runs one game per process (`src/pw_wine_launch.h`):
   - `[debug] env = NAME=VALUE` adds one variable to Wine's environment for
     that game, up to five lines, for diagnostics such as
     `env = PW_NATIVE_PROFILE=1` or `env = PW_VK_BATCH_STATS=1`. Names start
-    with `PW_`, `DXVK_`, `MESA_`, `GALLIUM_`, `ZINK_` (Zink's own options,
-    such as `ZINK_DESCRIPTORS=lazy`), `RADV_` or `VK_`; values take
+    with `PW_`, `DXVK_`, `VKD3D_` (vkd3d-proton's, such as
+    `VKD3D_FEATURE_LEVEL=12_0`), `MESA_`, `GALLIUM_`, `ZINK_` (Zink's own
+    options, such as `ZINK_DESCRIPTORS=lazy`), `RADV_` or `VK_`; values take
     letters, digits and `_ + - , . = : /`. A name the title sets itself is
     refused, so these only add: `PW_VK_BATCH`, `PW_INPUT_SHARED_FAST`,
-    `PW_QPC_TSC_*`, `GALLIUM_DRIVER`, and `DXVK_HUD` or `GALLIUM_HUD` while
-    `show_fps` is on (set `show_fps = false` to choose the HUD). The log
+    `PW_QPC_TSC_*`, `GALLIUM_DRIVER`, `DXVK_HUD` or `GALLIUM_HUD` while
+    `show_fps` is on (set `show_fps = false` to choose the HUD), and
+    `PW_FRAMEGEN` and `PW_FRAMEGEN_HUD` while `framegen` is on. The log
     names them (`PW_WINE64 debug_env=`).
     Titles built before the limit went up to five accept four lines.
   - `[runtime]` sets runtime behavior for that game only:
@@ -1068,7 +1144,7 @@ The title runs one game per process (`src/pw_wine_launch.h`):
       no pointer.
     - The game log's `PW_WINE64 display` line shows `xinput=1` when the
       runtime's ntdll has the gamepad slot.
-- **Closing.** Holding Options+Create for a second sends the game Alt+F4. When
+- **Closing.** Holding Options+Create for 3 s sends the game Alt+F4. When
   Wine exits, the title restarts into the launcher. If the game has not
   closed after 5 s, the title restarts into the launcher anyway.
 - **Unattended validation.** `-DPW_WINE64_SCRIPT=1` makes the launcher open

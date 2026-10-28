@@ -5,9 +5,9 @@
  * The title runs one game per process (src/pw_wine_launch.h). Started with
  * no game it shows the launcher, without loading Wine; choosing a game
  * restarts the title with sceSystemServiceLoadExec and the game's
- * arguments. Holding Options+Create in a game sends it Alt+F4; when Wine
- * exits, or the game does not close in time, the title restarts into the
- * launcher.
+ * arguments. Holding Options+Create for 3 s in a game sends it Alt+F4;
+ * when Wine exits, or the game does not close in time, the title restarts
+ * into the launcher.
  *
  * The launcher and a game request the /data mount, where the library is.
  * A game then loads ntdll.prx, prepares Wine's
@@ -19,6 +19,10 @@
  * Wine's address-space counters until Wine exits the process or the run
  * deadline passes. Wine's audio driver plays its mix on the console's main
  * audio port through the title's audio sink.
+ *
+ * A single-program title (tools/build_native.sh, PW_FIXED_PROFILE) has no
+ * launcher: started with no game it starts its one profile, and where the
+ * title would go back to the launcher it closes, to the console's home.
  */
 #include "ps5log/ps5log.h"
 #include "pw_diagnostics.h"
@@ -57,8 +61,16 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef PW_TITLE_ID
 #define PW_TITLE_ID "PPSA99995"
+#endif
 #define PW_APP_NAME "prospero-win-wine64"
+#ifndef PW_FIXED_PROFILE
+/* The id of the one profile a single-program title runs; "" for the launcher. */
+#define PW_FIXED_PROFILE ""
+#endif
+static const char fixed_profile[] = PW_FIXED_PROFILE;
+static int single_program(void) { return fixed_profile[0] != '\0'; }
 
 /* Where the title's Wine runtime can be seen: /app0 inside the sandbox;
  * once /data is granted the process sees the real root, where /app0 does
@@ -69,8 +81,12 @@
 #define PW_SANDBOX_APP0 "/mnt/sandbox/" PW_TITLE_ID "_000/app0"
 static const char *const runtime_roots[] = { "/app0", PW_SANDBOX_APP0 };
 /* The title's data: profiles/, input/, prefix/ and prefixes/<name>. */
+#ifndef PW_WINE64_ROOT_DATA
 #define PW_WINE64_ROOT_DATA "/data/prospero-win"            /* when /data is granted */
+#endif
+#ifndef PW_WINE64_ROOT_SANDBOX
 #define PW_WINE64_ROOT_SANDBOX "/download0/prospero-win"    /* sandbox fallback */
+#endif
 #ifndef PW_WINE64_DEBUG
 /* No +seh: WoW64 callback returns unwind with 80000026 many times a second
  * and would flood the sink. */
@@ -225,7 +241,10 @@ static const char *library_root = PW_WINE64_ROOT_SANDBOX;
  * (WINE_PS5_DESKTOP overrides, 1920x1080 for Warcraft III); bigger frames
  * are counted and dropped. */
 enum { PW_WINE64_MAX_FRAME = 1920 * 1200 * 4, PW_WINE64_TICK_US = 16000,
-       PW_WINE64_TICKS_PER_S = 60, PW_WINE64_CLOSE_WAIT_S = 5 };
+       PW_WINE64_TICKS_PER_S = 60, PW_WINE64_CLOSE_WAIT_S = 5, PW_WINE64_LEAVE_WAIT_S = 5,
+       /* Options+Create are also Start+Select, which games use together:
+        * closing takes a hold no game asks for. */
+       PW_WINE64_CLOSE_HOLD_S = 3 };
 
 enum { PAD_CREATE = 0x1u, PAD_OPTIONS = 0x8u, PAD_UP = 0x10u, PAD_RIGHT = 0x20u,
        PAD_DOWN = 0x40u, PAD_LEFT = 0x80u, PAD_L1 = 0x400u, PAD_R1 = 0x800u,
@@ -236,6 +255,8 @@ static const PwPadKeyMap pad_open_map[] = { { PAD_CROSS, 0x20, 0, 0, "cross" } }
 
 
 int sceSystemServiceLoadExec(const char *path, char *const argv[]);
+int sceSystemServiceGetAppIdOfRunningBigApp(void);
+int sceSystemServiceKillApp(int app_id, int how, int reason, int core_dump);
 int32_t sceKernelLoadStartModule(const char *path, size_t argc, const void *argv,
                                  uint32_t flags, const void *option, int *result);
 int sceKernelGetModuleInfo(int32_t handle, void *info);
@@ -629,14 +650,45 @@ static int capture_fd(int fd, PwFdForward *forward)
 
 static PwWineLaunch launch;
 
+/* End a single-program title for the console's home. A process that ends
+ * by itself, by exit() or _exit(0) alike, is reported by the console as
+ * "Something went wrong with this game or app"; one the system closes is
+ * not. So the title asks the system to close it, as the PS button's Close
+ * does (sceSystemServiceKillApp, as homebrew_ps5-optional-shsrv's
+ * bigapp-control closes a title), after its last flips are drained; if the
+ * system refuses, or has not closed it in PW_WINE64_LEAVE_WAIT_S, it ends
+ * itself. Does not return. */
+static void leave_to_home(const char *reason)
+{
+    int app_id, rc = -1;
+
+    display_quiesce(reason);
+    app_id = sceSystemServiceGetAppIdOfRunningBigApp();
+    PS5LOG_LOG("PW_WINE64 leave close app_id=0x%x", (unsigned)app_id);
+    pw_diagnostics_close(reason);
+    if (app_id > 0 && (rc = sceSystemServiceKillApp(app_id, -1, 0, 0)) == 0)
+        for (unsigned i = 0; i < PW_WINE64_LEAVE_WAIT_S * 10u; i++) usleep(100000);
+    pw_diagnostics_resume();
+    PS5LOG_LOG("PW_WINE64 leave close rc=0x%08x: ending the process", (unsigned)rc);
+    pw_diagnostics_close(reason);
+    _exit(0);
+}
+
 /* Replace this process with the title again: app's game, or the launcher
  * when app is NULL. /app0 is not visible once /data is granted, so the
- * sandbox's view of the same eboot is tried next. Returns only on failure. */
+ * sandbox's view of the same eboot is tried next. Returns only on failure.
+ * A single-program title has no launcher to go to: it closes itself for the
+ * console's home instead (leave_to_home). */
 static void restart_title(const PwWineApp *app, uint32_t cycle, const char *reason)
 {
     static const char *const eboots[] = { "/app0/eboot.bin", PW_SANDBOX_APP0 "/eboot.bin" };
     static char storage[2 * PW_WINE_LAUNCH_PATH_MAX + 64];
     char *next[PW_WINE_LAUNCH_ARGS];
+
+    if (!app && single_program()) {
+        PS5LOG_LOG("PW_WINE64 leave to=home cycle=%u reason=%s", (unsigned)cycle, reason);
+        leave_to_home(reason);
+    }
 
     if (!pw_wine_launch_argv(app, cycle, storage, sizeof(storage), next, PW_WINE_LAUNCH_ARGS)) {
         PS5LOG_LOG("PW_WINE64 restart refused: arguments do not fit");
@@ -1008,6 +1060,14 @@ int main(int argc, char **argv)
     PS5LOG_LOG("PW_WINE64 args argc=%d mode=%s profile=%s cycle=%u refused=%u", argc,
                launch.mode == PW_WINE_LAUNCH_GAME ? "game" : "launcher",
                launch.app ? launch.app->id : "-", (unsigned)launch.cycle, launch.refused);
+    if (launch.mode != PW_WINE_LAUNCH_GAME && single_program()) {
+        /* A single-program title starts its profile as the launcher would. */
+        for (uint32_t i = 0; i < catalog_count; i++)
+            if (!strcmp(catalog[i].id, fixed_profile)) restart_title(&catalog[i], launch.cycle, "fixed-profile");
+        PS5LOG_LOG("PW_WINE64 startup blocked reason=no-fixed-profile profile=%s", fixed_profile);
+        ps5log_close("no-fixed-profile");
+        return 1;
+    }
     if (launch.mode != PW_WINE_LAUNCH_GAME) run_launcher();
     wine_argv[1] = launch.executable;
     /* The game's profile: its prefix, desktop, scaling and input. A bare
@@ -1142,10 +1202,11 @@ int main(int argc, char **argv)
         if (game->display.refresh != 60 || game->display.opengl_thread)
             PS5LOG_LOG("PW_WINE64 ignored display refresh=%u opengl_thread=%d (no longer supported)",
                        (unsigned)game->display.refresh, game->display.opengl_thread);
-        PS5LOG_LOG("PW_WINE64 profile id=%s prefix=%s desktop=%s scaling=%d view=%s show_fps=%d input=%s "
-                   "preset=%s mode=%s mouse=%d dll_overrides=%s", game->app.id, prefix,
+        PS5LOG_LOG("PW_WINE64 profile id=%s prefix=%s desktop=%s scaling=%d view=%s show_fps=%d framegen=%u "
+                   "input=%s preset=%s mode=%s mouse=%d dll_overrides=%s", game->app.id, prefix,
                    desktop[0] ? desktop : "default",
-                   scaling, view, game->display.show_fps, pw_result_name(input_status),
+                   scaling, view, game->display.show_fps, game->display.framegen,
+                   pw_result_name(input_status),
                    game->input.preset[0] ? game->input.preset : "-",
                    game_input.mode == PW_GAME_INPUT_XINPUT ? "xinput" : "keyboard", (int)game_input.mouse,
                    effective_dll_overrides[0] ? effective_dll_overrides : "-");
@@ -1314,6 +1375,11 @@ int main(int argc, char **argv)
                 if (post_input(&input) == 0) posted++;
                 else refused++;
             }
+            if (poll.wheel) {
+                input = (PwWineInput){ PW_WINE_INPUT_MOUSE_WHEEL, 0, poll.wheel, 0, 0 };
+                if (post_input(&input) == 0) posted++;
+                else refused++;
+            }
             for (size_t i = 0; i < poll.count; i++) {
                 input = (PwWineInput){ poll.events[i].kind == PW_HID_EVENT_KEY ? PW_WINE_INPUT_KEY :
                                        PW_WINE_INPUT_MOUSE_BUTTON, poll.events[i].code, 0, 0,
@@ -1362,6 +1428,14 @@ int main(int argc, char **argv)
         }
 #endif
         int pad_read = pad_status == PW_OK && post_input && pw_pad_ps5_read(&pad) == PW_OK;
+        if (pad_read) {
+            static int pad_state = -1;
+            int state = pad.intercepted ? 2 : pad.core.connected ? 1 : 0;
+            if (state != pad_state) {
+                PS5LOG_LOG("PW_WINE64 pad state=%s", state == 2 ? "system" : state ? "connected" : "disconnected");
+                pad_state = state;
+            }
+        }
         /* The menu takes the pad while it is open: the game then sees it
          * idle, and the buttons that closed it stay the menu's until they
          * are let go. Closing the game below still reads the real pad. */
@@ -1416,8 +1490,9 @@ int main(int argc, char **argv)
             if (rumble && rumble(&left, &right) == 1) {
                 int vibrate = pw_pad_ps5_vibrate(&pad, (uint8_t)(left >> 8), (uint8_t)(right >> 8));
                 if (!vibrations++ || vibrate != PW_OK)
-                    PS5LOG_LOG("PW_WINE64 rumble left=%u right=%u status=%s rc=%d", (unsigned)left,
-                               (unsigned)right, pw_result_name(vibrate), pad.vibration_rc);
+                    PS5LOG_LOG("PW_WINE64 rumble left=%u right=%u status=%s rc=%d trigger_rc=%d",
+                               (unsigned)left, (unsigned)right, pw_result_name(vibrate),
+                               pad.vibration_rc, pad.trigger_rc);
             }
         }
         /* The second player's pad: keys only, through its own preset, read
@@ -1482,16 +1557,23 @@ int main(int argc, char **argv)
         }
         if (!presented) usleep(PW_WINE64_TICK_US);
 
-        /* Closing: Options+Create held for a second, or the deadline, asks
-         * the game to close with Alt+F4; Wine's exit then restarts the
-         * title (on_exit_report). A game that does not close is left. */
+        /* Closing: Options+Create held for PW_WINE64_CLOSE_HOLD_S, or the
+         * deadline, asks the game to close with Alt+F4; Wine's exit then
+         * restarts the title (on_exit_report). A game that does not close
+         * is left. */
         if (pad_status == PW_OK && (pad.core.pressed_edges & PAD_CREATE) &&
             !(pad.core.previous_buttons & PAD_OPTIONS))
             PS5LOG_LOG("PW_WINE64 marker by=player tick=%llu", (unsigned long long)tick);
+        if (pad_status == PW_OK && (pad.core.pressed_edges & PW_PAD_PS5_TOUCHPAD))
+            PS5LOG_LOG("PW_WINE64 touchpad x=%u y=%u fingers=%u from=%s half=%s", (unsigned)pad.touch_x,
+                       (unsigned)pad.touch_y, pad.touch_fingers,
+                       pad.touch_from == PW_PAD_PS5_TOUCH_FROM_CLICK ? "click" :
+                       pad.touch_from == PW_PAD_PS5_TOUCH_FROM_EARLIER ? "earlier" : "none",
+                       pad.touch_left ? "left" : "right");
         combo_ticks = pad_status == PW_OK && (pad.core.previous_buttons & PAD_CLOSE) == PAD_CLOSE ?
                       combo_ticks + 1 : 0;
         if (!close_requested &&
-            (combo_ticks >= PW_WINE64_TICKS_PER_S ||
+            (combo_ticks >= PW_WINE64_CLOSE_HOLD_S * PW_WINE64_TICKS_PER_S ||
              (PW_WINE64_SECONDS && now - started >= (uint64_t)PW_WINE64_SECONDS * 1000000000u))) {
             static const PwWineInput alt_f4[] = {
                 { PW_WINE_INPUT_KEY, 0x12, 0, 0, 1 }, { PW_WINE_INPUT_KEY, 0x73, 0, 0, 1 },

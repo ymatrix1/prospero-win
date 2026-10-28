@@ -160,6 +160,13 @@ things differ from Lutris:
   in the installer and pass `--mesa-zink DIR` (below); this choice skips DXVK
   installation even if the Lutris `wine` section has `dxvk: true` (see the
   [OpenGL build notes](WINE_PS5_BUILD.md#opengl)).
+- **Direct3D 12 (experimental).** `wine: {dxvk: true, vkd3d: true}` also
+  installs vkd3d-proton 3.0.1 (`vkd3d_version` picks a pinned release); it
+  needs DXVK's dxgi, so it is refused without the dxvk backend. A game that
+  insists on feature level 12_0 or later needs
+  `[debug] env = VKD3D_FEATURE_LEVEL=12_0` in its profile, and the in-game
+  menu and FPS counter don't show in Direct3D 12 games: see
+  [Direct3D 12](WINE_PS5_BUILD.md#direct3d-12).
 - **32-bit games** (`arch: win32`) still get a 64-bit prefix. The PS5's Wine
   is WoW64 only, and it runs 32-bit programs inside a 64-bit prefix.
 - **Installers that show a web page** (a license, for example) need
@@ -220,8 +227,10 @@ prospero:
 the pinned DXVK release. `opengl` installs Mesa's WGL/Zink into the prefix
 and selects native `opengl32`, so the game draws OpenGL through Zink on top of
 Vulkan; `zink` is an older name for the same thing, and the profile says
-`graphics = opengl`. `display` also takes `view`, and `show_fps: false` hides
-the frame-rate counter a game shows in the top-left corner by default.
+`graphics = opengl`. `display` also takes `view`, `show_fps: false` hides
+the frame-rate counter a game shows in the top-left corner by default, and
+`framegen: 2` (or `3`, `4`; `off` by default) turns on frame generation for
+the game.
 `refresh` and `opengl_thread` belonged to the old PS5 OpenGL SDK; they are
 still accepted and have no effect.
 

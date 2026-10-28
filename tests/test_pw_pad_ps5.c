@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #include "../native/pw_pad_ps5.h"
 #include <assert.h>
+#include <limits.h>
 #include <string.h>
 
 static PwPadPs5Data fixture[64];static int fixture_count,read_rc,user_init_rc;
@@ -25,13 +26,53 @@ static int login_users(int32_t ids[PW_PAD_PS5_USERS])
 static int vibration_mode_calls,vibration_mode_seen;
 static int pad_set_vibration_mode(int32_t h,int32_t m)
 {assert(h==7);vibration_mode_calls++;vibration_mode_seen=m;return 0;}
+static int trigger_calls,trigger_rc;static PwPadPs5TriggerEffect trigger_seen;
+static int pad_set_trigger_effect(int32_t h,const PwPadPs5TriggerEffect *e)
+{assert(h==7);trigger_calls++;trigger_seen=*e;return trigger_rc;}
 static const PwPadPs5Ops ops={user_initialize,foreground,terminate,pad_init,pad_open,pad_read,pad_close,
-                              pad_set_vibration,login_users,pad_set_vibration_mode};
-enum { CREATE=0x1,L1=0x400 };
+                              pad_set_vibration,login_users,pad_set_vibration_mode,
+                              pad_set_trigger_effect};
+enum { CREATE=0x1,L1=0x400,TOUCHPAD=0x100000 };
 static const PwPadKeyMap map[]={{L1,'Z',0,0,"left-flipper"}};
+
+/* L2 and R2 vibrate with the motors: amplitude 0..8 from the stronger one,
+ * 30 Hz when the large one leads and 60 Hz when the small one does, set only
+ * when that changes. A failed effect leaves the rumble's result alone and
+ * is not tried again until the rumble changes. */
+static void test_trigger_rumble(void)
+{
+    PwPadPs5 pad;
+    assert(pw_pad_ps5_open(&pad,&ops,map,1)==PW_OK && pad.trigger_rc==INT_MIN);
+    int calls=trigger_calls;
+    assert(pw_pad_ps5_vibrate(&pad,255,10)==PW_OK && trigger_calls==calls+1 && !pad.trigger_rc);
+    assert(trigger_seen.mask==(PW_PAD_PS5_TRIGGER_L2|PW_PAD_PS5_TRIGGER_R2));
+    for(int i=0;i<2;i++)
+        assert(trigger_seen.command[i].mode==PW_PAD_PS5_TRIGGER_VIBRATION &&
+               trigger_seen.command[i].data[0]==1 && trigger_seen.command[i].data[1]==8 &&
+               trigger_seen.command[i].data[2]==30);
+    assert(pw_pad_ps5_vibrate(&pad,254,0)==PW_OK && trigger_calls==calls+1);   /* unchanged */
+    assert(pw_pad_ps5_vibrate(&pad,0,40)==PW_OK && trigger_calls==calls+2 &&
+           trigger_seen.command[1].data[1]==2 && trigger_seen.command[1].data[2]==60);
+    trigger_rc=-1;
+    assert(pw_pad_ps5_vibrate(&pad,0,0)==PW_OK && pad.trigger_rc==-1 && trigger_calls==calls+3);
+    assert(pw_pad_ps5_vibrate(&pad,0,0)==PW_OK && trigger_calls==calls+3);   /* not retried */
+    trigger_rc=0;
+    assert(pw_pad_ps5_vibrate(&pad,100,0)==PW_OK && trigger_calls==calls+4 && !pad.trigger_rc &&
+           trigger_seen.command[0].data[1]==4);
+    assert(pw_pad_ps5_vibrate(&pad,0,0)==PW_OK && trigger_calls==calls+5 &&
+           trigger_seen.command[0].mode==PW_PAD_PS5_TRIGGER_OFF && !trigger_seen.command[0].data[1]);
+    assert(pw_pad_ps5_vibrate(&pad,0,0)==PW_OK && trigger_calls==calls+5);
+    vibration_rc=-5;   /* a failed rumble is still the call's result */
+    assert(pw_pad_ps5_vibrate(&pad,100,0)==PW_ERR_STATE && trigger_calls==calls+6);
+    vibration_rc=0;
+    assert(pw_pad_ps5_close(&pad)==PW_OK);
+    init_calls=foreground_calls=pad_init_calls=open_calls=read_calls=close_calls=terminate_calls=0;
+    vibration_calls=vibration_mode_calls=0;
+}
 
 int main(void)
 {
+    test_trigger_rumble();
     PwPadPs5 pad;
     assert(pw_pad_ps5_open(&pad,&ops,map,1)==PW_OK && pad.opened && pad.pad_handle==7);
     assert(pad.left_stick.x==0x80 && pad.right_stick.y==0x80 && !pad.l2 && !pad.r2);
@@ -44,13 +85,14 @@ int main(void)
                            !pad.core.pressed_edges && !pad.core.released_edges);
     fixture_count=1;fixture[0].buttons=0x80000000u|L1;fixture[0].timestamp=2000;
     assert(pw_pad_ps5_read(&pad)==PW_OK);
+    assert(pad.intercepted && !pad.core.connected);
     assert(pad.intercepted_samples==1 && pad.core.released_edges==(L1|CREATE) &&
            !pad.core.previous_buttons);
-    read_rc=-9;assert(pw_pad_ps5_read(&pad)==PW_OK&&pad.read_errors==1);
+    read_rc=-9;assert(pw_pad_ps5_read(&pad)==PW_OK&&pad.read_errors==1&&!pad.intercepted);
     read_rc=0;
     fixture[0]=(PwPadPs5Data){.buttons=CREATE,.connected=1,.timestamp=3000,.connected_count=1};
     fixture_count=1;assert(pw_pad_ps5_read(&pad)==PW_OK);
-    assert(pad.core.pressed_edges==CREATE && pad.core.previous_buttons==CREATE);
+    assert(pad.core.pressed_edges==CREATE && pad.core.previous_buttons==CREATE && !pad.intercepted);
     /* Sticks and triggers follow the newest connected sample... */
     fixture[0]=(PwPadPs5Data){.buttons=CREATE,.left_stick={10,250},.right_stick={200,40},
                               .l2=30,.r2=255,.connected=1,.timestamp=3100,.connected_count=1};
@@ -72,6 +114,41 @@ int main(void)
                       pad.core.released_edges==CREATE && !pad.core.previous_buttons &&
                       pad.right_stick.x==0x80);
     read_rc=0;
+    /* The touchpad click keeps the half it began on: the finger's x when
+     * pressed, not where it slides, and the middle without a touch. */
+    PwPadPs5Data touch={.buttons=TOUCHPAD,.connected=1,.timestamp=5000,.connected_count=1,
+                        .touch_data={.fingers=1,.touch={{.x=300,.y=500}}}};
+    fixture[0]=touch;fixture_count=1;assert(pw_pad_ps5_read(&pad)==PW_OK);
+    assert(pad.touch_held && pad.touch_left && pad.touch_x==300);
+    fixture[0].touch_data.touch[0].x=1800;fixture[0].timestamp=5100;
+    assert(pw_pad_ps5_read(&pad)==PW_OK && pad.touch_left && pad.touch_x==300);
+    fixture[0].buttons=0;fixture[0].timestamp=5200;
+    assert(pw_pad_ps5_read(&pad)==PW_OK && !pad.touch_held);
+    /* released and pressed again in one batch: the new press's x */
+    fixture[0]=touch;fixture[0].touch_data.touch[0].x=959;fixture[1]=touch;fixture[1].buttons=0;
+    fixture[2]=touch;fixture[2].touch_data.touch[0].x=960;fixture_count=3;
+    assert(pw_pad_ps5_read(&pad)==PW_OK && pad.touch_held && !pad.touch_left && pad.touch_x==960);
+    /* an intercepted sample releases it; a press with no touch is the middle, the right */
+    fixture[0]=touch;fixture[0].buttons=0x80000000u|TOUCHPAD;fixture_count=1;
+    assert(pw_pad_ps5_read(&pad)==PW_OK && !pad.touch_held);
+    fixture[0]=touch;fixture[0].touch_data.fingers=0;fixture[0].touch_data.touch[0].x=10;
+    assert(pw_pad_ps5_read(&pad)==PW_OK && pad.touch_held && !pad.touch_left && pad.touch_x==960 &&
+           pad.touch_from==PW_PAD_PS5_TOUCH_FROM_NONE && !pad.touch_fingers);
+    /* A click whose sample has no touch takes the finger's last position
+     * before it, while the finger stayed down... */
+    fixture[0]=touch;fixture[0].buttons=0;fixture[0].touch_data.touch[0]=(PwPadPs5Touch){.x=120,.y=700};
+    fixture[1]=fixture[0];fixture[1].buttons=TOUCHPAD;fixture[1].touch_data.fingers=0;fixture_count=2;
+    assert(pw_pad_ps5_read(&pad)==PW_OK && pad.touch_held && pad.touch_left && pad.touch_x==120 &&
+           pad.touch_y==700 && pad.touch_from==PW_PAD_PS5_TOUCH_FROM_EARLIER);
+    /* ... not once it was lifted; the click's own touch comes first. */
+    fixture[0].touch_data.fingers=0;fixture[1].buttons=0;fixture[1].touch_data.fingers=0;
+    fixture[2]=fixture[1];fixture[2].buttons=TOUCHPAD;fixture_count=3;
+    assert(pw_pad_ps5_read(&pad)==PW_OK && pad.touch_held && !pad.touch_left &&
+           pad.touch_from==PW_PAD_PS5_TOUCH_FROM_NONE);
+    fixture[0]=touch;fixture[0].buttons=0;fixture[1]=touch;fixture[1].touch_data.touch[0].x=1500;fixture_count=2;
+    assert(pw_pad_ps5_read(&pad)==PW_OK && !pad.touch_left && pad.touch_x==1500 && pad.touch_fingers==1 &&
+           pad.touch_from==PW_PAD_PS5_TOUCH_FROM_CLICK);
+    fixture_count=0;
     /* Vibration: both motors in order, a failure kept, nothing without the op. */
     assert(pw_pad_ps5_vibrate(&pad,200,10)==PW_OK && vibration_calls==1 &&
            motors_seen[0]==200 && motors_seen[1]==10 && !pad.vibration_rc);

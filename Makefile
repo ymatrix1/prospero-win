@@ -177,6 +177,7 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	python3 tests/test_wine_runtime_manifest.py
 	python3 tests/test_wine_protect_writecopy.py
 	python3 tests/test_wine_decommit_zero.py
+	python3 tests/test_wine_subpage_protect.py
 	python3 tests/test_wine_seh_fp_state.py
 	python3 tests/test_wine_narrow_syscall_args.py
 	python3 tests/test_wine_sched_probe.py
@@ -184,6 +185,8 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	python3 tests/test_wine_process_counters.py
 	python3 tests/test_wine_processor_times.py
 	python3 tests/test_wine_directory_changes.py
+	python3 tests/test_wine_directory_handles.py
+	python3 tests/test_d3d12_control.py
 	python3 tests/test_wine_dib_section.py
 	python3 tests/test_wow64native_scaffold.py
 	python3 tests/test_vk_command_stream.py
@@ -202,6 +205,7 @@ test: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/classify_x86 $(BUILD)/dbt_differe
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wowprospero_unmap.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wowprospero_service_return.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_image_view_fds.py
+	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_wine_mouse_wheel.py
 	python3 tests/test_build_wine_ps5.py
 	python3 tests/test_build_tls_ps5.py
 	CC="$(CC)" CFLAGS="$(CFLAGS)" python3 tests/test_ws2_fqdn.py
@@ -247,6 +251,7 @@ wine-check: test
 	python3 tests/test_wine_runtime_manifest.py
 	python3 tests/test_wine_protect_writecopy.py
 	python3 tests/test_wine_decommit_zero.py
+	python3 tests/test_wine_subpage_protect.py
 	python3 tests/test_wine_seh_fp_state.py
 	python3 tests/test_wine_narrow_syscall_args.py
 	python3 tests/test_wine_sched_probe.py
@@ -254,6 +259,8 @@ wine-check: test
 	python3 tests/test_wine_process_counters.py
 	python3 tests/test_wine_processor_times.py
 	python3 tests/test_wine_directory_changes.py
+	python3 tests/test_wine_directory_handles.py
+	python3 tests/test_d3d12_control.py
 	python3 tests/test_wine_dib_section.py
 
 audit:
